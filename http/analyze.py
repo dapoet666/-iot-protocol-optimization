@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""Analyze one IoT experiment folder.
-
-Expected input files:
-  sensor_h*.csv : sensor logs with sensor_id, seq, send_epoch_ns
-  receive.csv   : HTTP server log with sensor_id, seq, receive_epoch_ns
-  capture.pcap  : optional classic PCAP captured by tcpdump
-
-Outputs:
-  summary.csv, per_sensor.csv, delays.csv, and optional PNG charts.
-"""
-
 from __future__ import annotations
 
 import argparse
