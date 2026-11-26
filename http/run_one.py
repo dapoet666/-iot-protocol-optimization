@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""Run one HTTP K1 experiment on the group's Mininet topology.
-
-This first version intentionally automates K1 (unshaped/good network). It uses
-Gia Bao's topo.py and the user's sensor.py, starts the HTTP server and UDP->HTTP
-adapter, captures HTTP packets on r1-eth0, and saves all run artifacts.
-
-K2/WAN shaping is left as an integration point until the exact wan.py interface
-from the network owner is available; this script does not guess that API.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -40,7 +29,7 @@ def load_topology_class(topo_file: Path):
 
 
 def wait_for_tcp(node: Any, port: int, timeout: float = 10.0) -> None:
-    """Wait until a TCP listener is reachable from inside a Mininet node."""
+    
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         # Run the check inside the server's network namespace.
