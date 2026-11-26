@@ -68,11 +68,7 @@ def read_receive_log(path: Path) -> dict[tuple[int, int], int]:
 
 
 def read_classic_pcap_stats(path: Path) -> dict[str, int] | None:
-    """Return frame count, captured bytes and original on-wire bytes.
-
-    Supports classic tcpdump PCAP (microsecond or nanosecond timestamps).
-    PCAP-NG is not supported by this small dependency-free reader.
-    """
+    
     if not path.is_file():
         return None
 
@@ -130,7 +126,7 @@ def percentile_nearest_rank(values: list[float], percentile: float) -> float | N
 
 
 def mean_ci95(values: list[float]) -> tuple[float | None, float | None]:
-    """95% t confidence interval for the sample mean."""
+    
     n = len(values)
     if n < 2:
         return None, None
