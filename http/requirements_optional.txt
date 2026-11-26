@@ -1,0 +1,2 @@
+# Only needed when you want analyze.py to generate PNG charts.
+matplotlib>=3.7
