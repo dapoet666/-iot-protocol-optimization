@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""Gateway adapter: receive 10-byte UDP sensor datagrams and forward by HTTP.
-
-Two forwarding modes are supported:
-  --mode keep-alive : reuse one HTTP/1.1 TCP connection where possible.
-  --mode new        : open and close one HTTP connection for each datagram.
-"""
-
 from __future__ import annotations
 
 import argparse
