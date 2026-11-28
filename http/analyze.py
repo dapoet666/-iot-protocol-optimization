@@ -157,7 +157,7 @@ def make_plots(output_dir: Path, delays_ms: list[float], summary: dict[str, Any]
         plt.hist(delays_ms, bins=20)
         plt.xlabel("One-way application delay (ms)")
         plt.ylabel("Received messages")
-        plt.title("HTTP message delay distribution")
+        plt.title("IoT message delay distribution")
         plt.tight_layout()
         plt.savefig(output_dir / "latency_hist.png", dpi=150)
         plt.close()
