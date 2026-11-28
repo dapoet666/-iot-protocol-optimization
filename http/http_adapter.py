@@ -6,12 +6,14 @@ import http.client
 import os
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
 from datetime import datetime, timezone
 
-from protocol import PACKET_SIZE, decode_packet
+SENSOR_RECORD = struct.Struct("!HIf")
+SENSOR_PACKET_SIZE = SENSOR_RECORD.size
 
 
 class Adapter:
@@ -148,9 +150,18 @@ class Adapter:
                 except socket.timeout:
                     continue
 
+                if len(payload) != SENSOR_PACKET_SIZE:
+                    detail = (
+                        f"Invalid sensor packet size: expected "
+                        f"{SENSOR_PACKET_SIZE}, got {len(payload)}"
+                    )
+                    print(f"Invalid UDP datagram from {source}: {detail}", file=sys.stderr)
+                    self._write_log("", "", source[0], source[1], len(payload), False, None, detail)
+                    continue
+
                 try:
-                    sensor_id, sequence_id, _measurement = decode_packet(payload)
-                except ValueError as exc:
+                    sensor_id, sequence_id, _measurement = SENSOR_RECORD.unpack(payload)
+                except struct.error as exc:
                     print(f"Invalid UDP datagram from {source}: {exc}", file=sys.stderr)
                     self._write_log("", "", source[0], source[1], len(payload), False, None, str(exc))
                     continue
@@ -216,3 +227,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
