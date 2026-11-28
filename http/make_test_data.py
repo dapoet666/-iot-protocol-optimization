@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-"""Create deterministic synthetic send/receive CSV files for testing analyze.py."""
-
 from __future__ import annotations
 
 import argparse
