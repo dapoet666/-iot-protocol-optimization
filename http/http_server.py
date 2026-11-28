@@ -2,216 +2,153 @@ from __future__ import annotations
 
 import argparse
 import csv
-import http.client
 import os
-import signal
-import socket
-import sys
+import struct
 import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TextIO
 
-from protocol import PACKET_SIZE, decode_packet
+SENSOR_RECORD = struct.Struct("!HIf")
+SENSOR_PACKET_SIZE = SENSOR_RECORD.size
 
 
-class Adapter:
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.args = args
-        self.stop_event = threading.Event()
-        self.log_lock = threading.Lock()
-        self.http_connection: http.client.HTTPConnection | None = None
-        self.log_file = None
-        self.log_writer = None
+RECEIVE_FIELDS = [
+    "sensor_id",
+    "seq",
+    "recv_epoch_ns",
+    "measurement",
+    "recv_time_utc",
+    "client_ip",
+    "body_bytes",
+]
 
-    def _get_keepalive_connection(self) -> http.client.HTTPConnection:
-        if self.http_connection is None:
-            self.http_connection = http.client.HTTPConnection(
-                self.args.server_host,
-                self.args.server_port,
-                timeout=self.args.timeout,
-            )
-        return self.http_connection
 
-    def _forward(self, payload: bytes) -> tuple[bool, int | None, str]:
-        connection: http.client.HTTPConnection
-        owns_connection = self.args.mode == "new"
+class IoTHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
-        if owns_connection:
-            connection = http.client.HTTPConnection(
-                self.args.server_host,
-                self.args.server_port,
-                timeout=self.args.timeout,
-            )
+
+class IoTRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "IoTExperimentHTTP/1.0"
+
+    def _reply(self, status: int, message: str) -> None:
+        body = message.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self.path == "/health":
+            self._reply(200, "OK")
         else:
-            connection = self._get_keepalive_connection()
+            self._reply(404, "Not Found")
 
-        headers = {
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(len(payload)),
-        }
-        if owns_connection:
-            headers["Connection"] = "close"
-
-        try:
-            connection.request("POST", self.args.path, body=payload, headers=headers)
-            response = connection.getresponse()
-            response_body = response.read()  # Must consume body before reusing connection.
-            status = response.status
-            response_text = response_body.decode("utf-8", errors="replace")[:100]
-            ok = 200 <= status < 300
-            if not owns_connection and (response.will_close or connection.sock is None):
-                connection.close()
-                self.http_connection = None
-            return ok, status, response_text
-        except (OSError, http.client.HTTPException) as exc:
-            connection.close()
-            if not owns_connection:
-                self.http_connection = None
-            return False, None, str(exc)
-        finally:
-            if owns_connection:
-                connection.close()
-
-    def _write_log(
-        self,
-        sensor_id: int | str,
-        sequence_id: int | str,
-        source_ip: str,
-        source_port: int,
-        payload_size: int,
-        success: bool,
-        http_status: int | None,
-        detail: str,
-    ) -> None:
-        if self.log_writer is None:
+    def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        if self.path != "/telemetry":
+            self._reply(404, "Not Found")
             return
-        now_ns = time.time_ns()
-        with self.log_lock:
-            self.log_writer.writerow(
-                [
-                    now_ns,
-                    datetime.fromtimestamp(now_ns / 1_000_000_000, timezone.utc).isoformat(),
-                    sensor_id,
-                    sequence_id,
-                    source_ip,
-                    source_port,
-                    payload_size,
-                    self.args.mode,
-                    "OK" if success else "ERROR",
-                    http_status if http_status is not None else "",
-                    detail.replace("\n", " ")[:200],
-                ]
-            )
-            self.log_file.flush()
 
-    def run(self) -> None:
-        if self.args.log:
-            os.makedirs(os.path.dirname(os.path.abspath(self.args.log)), exist_ok=True)
-            self.log_file = open(self.args.log, "w", newline="", encoding="utf-8")
-            self.log_writer = csv.writer(self.log_file)
-            self.log_writer.writerow(
-                [
-                    "adapter_epoch_ns",
-                    "adapter_time_utc",
-                    "sensor_id",
-                    "seq",
-                    "sensor_ip",
-                    "sensor_port",
-                    "udp_payload_bytes",
-                    "http_mode",
-                    "forward_status",
-                    "http_status",
-                    "detail",
-                ]
-            )
-
-        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp_socket.bind((self.args.udp_host, self.args.udp_port))
-        udp_socket.settimeout(0.5)
-        if self.args.ready_file:
-            ready_path = os.path.abspath(self.args.ready_file)
-            os.makedirs(os.path.dirname(ready_path), exist_ok=True)
-            with open(ready_path, "w", encoding="utf-8") as ready:
-                ready.write("ready\n")
-
-        print(
-            f"UDP adapter listening on {self.args.udp_host}:{self.args.udp_port}; "
-            f"forwarding to http://{self.args.server_host}:{self.args.server_port}"
-            f"{self.args.path} using {self.args.mode}"
-        )
-
+        raw_length = self.headers.get("Content-Length")
         try:
-            while not self.stop_event.is_set():
-                try:
-                    payload, source = udp_socket.recvfrom(65535)
-                except socket.timeout:
-                    continue
+            content_length = int(raw_length) if raw_length is not None else -1
+        except ValueError:
+            content_length = -1
 
-                try:
-                    sensor_id, sequence_id, _measurement = decode_packet(payload)
-                except ValueError as exc:
-                    print(f"Invalid UDP datagram from {source}: {exc}", file=sys.stderr)
-                    self._write_log("", "", source[0], source[1], len(payload), False, None, str(exc))
-                    continue
+        if content_length != SENSOR_PACKET_SIZE:
+            # Close malformed requests so unread bytes cannot be interpreted as
+            # another HTTP/1.1 request on the same persistent connection.
+            self.close_connection = True
+            self._reply(400, f"Expected Content-Length: {SENSOR_PACKET_SIZE}")
+            return
 
-                ok, status, detail = self._forward(payload)
-                self._write_log(
+        payload = self.rfile.read(content_length)
+        if len(payload) != SENSOR_PACKET_SIZE:
+            self.close_connection = True
+            self._reply(400, "Incomplete request body")
+            return
+
+        # Decode the same 10-byte format used by sensor.py: !HIf.
+        try:
+            sensor_id, sequence_id, measurement = SENSOR_RECORD.unpack(payload)
+        except struct.error as exc:
+            self.close_connection = True
+            self._reply(400, f"Invalid sensor packet: {exc}")
+            return
+
+        # Timestamp is recorded after the complete body has arrived.
+        recv_epoch_ns = time.time_ns()
+        recv_time_utc = datetime.fromtimestamp(
+            recv_epoch_ns / 1_000_000_000, timezone.utc
+        ).isoformat(timespec="microseconds")
+
+        # One CSV file/writer is shared by request threads. The lock protects
+        # each row, and flush makes the row visible during/after a run.
+        lock = self.server.log_lock  # type: ignore[attr-defined]
+        writer = self.server.log_writer  # type: ignore[attr-defined]
+        log_file: TextIO = self.server.log_file  # type: ignore[attr-defined]
+        with lock:
+            writer.writerow(
+                [
                     sensor_id,
                     sequence_id,
-                    source[0],
-                    source[1],
+                    recv_epoch_ns,
+                    f"{measurement:.9g}",
+                    recv_time_utc,
+                    self.client_address[0],
                     len(payload),
-                    ok,
-                    status,
-                    detail,
-                )
-                if not ok:
-                    print(
-                        f"Forward failed: sensor={sensor_id}, seq={sequence_id}: {detail}",
-                        file=sys.stderr,
-                    )
-        finally:
-            udp_socket.close()
-            if self.http_connection is not None:
-                self.http_connection.close()
-            if self.log_file is not None:
-                self.log_file.close()
+                ]
+            )
+            log_file.flush()
 
-    def stop(self, *_: object) -> None:
-        self.stop_event.set()
+        self._reply(200, "OK")
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        # Keep console output compact; the run controller redirects this to a log.
+        print(f"[{self.log_date_time_string()}] {self.address_string()} {fmt % args}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="UDP-to-HTTP IoT gateway adapter")
-    parser.add_argument("--udp-host", default="0.0.0.0", help="UDP bind address")
-    parser.add_argument("--udp-port", type=int, default=5000, help="UDP listen port")
-    parser.add_argument("--server-host", default="10.0.3.2", help="HTTP server IP/host")
-    parser.add_argument("--server-port", type=int, default=8080, help="HTTP server port")
-    parser.add_argument("--path", default="/telemetry", help="HTTP POST path")
-    parser.add_argument(
-        "--mode", choices=("keep-alive", "new"), default="keep-alive",
-        help="Reuse HTTP connection or open a new one per UDP packet",
-    )
-    parser.add_argument("--timeout", type=float, default=5.0, help="HTTP timeout in seconds")
-    parser.add_argument("--log", default="", help="Optional adapter CSV log path")
-    parser.add_argument("--ready-file", default="", help="Optional file touched after UDP bind is ready")
+    parser = argparse.ArgumentParser(description="IoT HTTP/1.1 telemetry server")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
+    parser.add_argument("--port", type=int, default=8080, help="HTTP port")
+    parser.add_argument("--log", default="logs/receive.csv", help="Receive CSV path")
     args = parser.parse_args()
 
-    for name in ("udp_port", "server_port"):
-        if not 1 <= getattr(args, name) <= 65535:
-            parser.error(f"--{name.replace('_', '-')} must be between 1 and 65535")
-    if args.timeout <= 0:
-        parser.error("--timeout must be positive")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
 
-    adapter = Adapter(args)
-    signal.signal(signal.SIGINT, adapter.stop)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, adapter.stop)
+    os.makedirs(os.path.dirname(os.path.abspath(args.log)), exist_ok=True)
+    server = IoTHTTPServer((args.host, args.port), IoTRequestHandler)
+
+    # Match the MQTT logger's lifecycle: open once at startup, write the header
+    # once, append rows from callbacks/handlers, then close at shutdown.
+    log_file = open(args.log, "w", newline="", buffering=1, encoding="utf-8")
+    log_writer = csv.writer(log_file)
+    log_writer.writerow(RECEIVE_FIELDS)
+    log_file.flush()
+
+    server.log_file = log_file  # type: ignore[attr-defined]
+    server.log_writer = log_writer  # type: ignore[attr-defined]
+    server.log_lock = threading.Lock()  # type: ignore[attr-defined]
+
+    print(f"HTTP/1.1 server listening on {args.host}:{args.port}")
+    print(f"Receive log: {os.path.abspath(args.log)}")
+    print("Health endpoint: GET /health")
+    print("Telemetry endpoint: POST /telemetry (10-byte body)")
+
     try:
-        adapter.run()
-    except OSError as exc:
-        parser.error(str(exc))
+        server.serve_forever(poll_interval=0.2)
+    except KeyboardInterrupt:
+        print("Stopping HTTP server...")
+    finally:
+        server.server_close()
+        log_file.flush()
+        log_file.close()
 
 
 if __name__ == "__main__":
