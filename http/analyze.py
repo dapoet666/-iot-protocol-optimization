@@ -46,20 +46,25 @@ def read_sensor_logs(run_dir: Path) -> dict[tuple[int, int], int]:
 
 
 def read_receive_log(path: Path) -> dict[tuple[int, int], int]:
+   
     if not path.is_file():
         raise FileNotFoundError(f"Receive log not found: {path}")
     received: dict[tuple[int, int], int] = {}
     with path.open("r", newline="", encoding="utf-8") as file:
         reader = csv.DictReader(file)
-        required = {"sensor_id", "seq", "receive_epoch_ns"}
-        if not reader.fieldnames or not required.issubset(reader.fieldnames):
-            raise ValueError(
-                f"{path.name} must contain columns: {', '.join(sorted(required))}"
-            )
+        fields = set(reader.fieldnames or [])
+        timestamp_column = next(
+            (name for name in ("recv_epoch_ns", "receive_epoch_ns") if name in fields),
+            None,
+        )
+        required = {"sensor_id", "seq"}
+        if not required.issubset(fields) or timestamp_column is None:
+            expected = "sensor_id, seq, and either recv_epoch_ns or receive_epoch_ns"
+            raise ValueError(f"{path.name} must contain columns: {expected}")
         for row in reader:
             try:
                 key = (int(row["sensor_id"]), int(row["seq"]))
-                timestamp = int(row["receive_epoch_ns"])
+                timestamp = int(row[timestamp_column])
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"Invalid receive-log row: {row}") from exc
             # Duplicates count once for delivery ratio; keep first arrival for delay.
@@ -176,12 +181,17 @@ def make_plots(output_dir: Path, delays_ms: list[float], summary: dict[str, Any]
 
 
 def analyze_run(run_dir: Path, output_dir: Path, pcap_path: Path | None = None,
-                create_plots: bool = True) -> dict[str, Any]:
+                create_plots: bool = True,
+                receive_path: Path | None = None) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     sent = read_sensor_logs(run_dir)
-    received = read_receive_log(run_dir / "receive.csv")
+    if receive_path is None:
+        receive_path = run_dir / "receive.csv"
+    elif not receive_path.is_absolute():
+        receive_path = run_dir / receive_path
+    received = read_receive_log(receive_path)
 
     matched_keys = sorted(set(sent).intersection(received))
     delays_ms = [
@@ -285,11 +295,17 @@ def main() -> int:
                         help="Output folder; default <run-dir>/analysis")
     parser.add_argument("--pcap", type=Path, default=None,
                         help="Optional explicit classic PCAP path")
+    parser.add_argument(
+        "--receive-log", type=Path, default=None,
+        help="Receiver CSV path; default <run-dir>/receive.csv. Relative paths are resolved under run-dir.",
+    )
     parser.add_argument("--no-plots", action="store_true")
     args = parser.parse_args()
 
     output_dir = args.output_dir or (args.run_dir / "analysis")
-    summary = analyze_run(args.run_dir, output_dir, args.pcap, not args.no_plots)
+    summary = analyze_run(
+        args.run_dir, output_dir, args.pcap, not args.no_plots, args.receive_log
+    )
     print("Analysis completed.")
     print(f"Sent: {summary['sent_messages']}")
     print(f"Received: {summary['received_messages']}")
